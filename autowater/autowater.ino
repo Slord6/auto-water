@@ -1,8 +1,3 @@
-/*
-    Description: Read the ADC value measured by the Watering Unit, and the water pump can be switched on and off through the middle button.
-*/
-
-
 #include <M5StickC.h>
 
 #define EARTH_PIN 33
@@ -12,13 +7,13 @@ int screenSelection = 0;
 int secondarySelection = 0;
 typedef void (*BtnHandler) (int, int);
 
-int minTimeBetweenWatering = 30000; // Water every 30 seconds max
+int minTimeBetweenWatering = 20000; // Water every 20 seconds max
 int autoPumpActiveTime = 3000; // 3 seconds
-int pumpLastActivated = -9999;
-int requiresWateringReading = 2000;
-int readingWaitTime = 30000; // Check if we can water once every 30 secs
-int lastCheckedToWater = -9999;
-int lastWatered = -9999;
+int pumpLastActivated = -9999; // at what millis() was the pump last activated (ie went from off -> on)
+int requiresWateringReading = 2000; //What ADC reading do we need for the pump to activate
+int readingWaitTime = 60000; // Check if we can water once every 60 secs
+int lastCheckedToWater = -9999; // when the system last checked if we needed to water
+int lastWatered = -9999; // when the system last watered
 
 bool pumpActiveFlag = true;
 int rawADC;
@@ -36,7 +31,7 @@ void setup() {
 void setPump(int active) {
   pumpActiveFlag = active;
   digitalWrite(PUMP_PIN, pumpActiveFlag);
-  Serial.printf("Pump active? = %d\n", pumpActiveFlag);
+  Serial.printf("Pump active: %d\n", pumpActiveFlag);
 
   // we store the lastWatered when the pump is turned off
   if(!active) lastWatered = millis();
@@ -53,8 +48,61 @@ void btnTogglePump(int earthReading, int pumpActive) {
   togglePump();
 }
 
-void screenOffController(int earthReading, int pumpActive) {
-  M5.Axp.ScreenBreath(7);
+int secondsSinceWatered() {
+  return (millis() - lastCheckedToWater) / 1000;
+}
+
+bool pumpShouldTurnOff(int pumpActive) {
+  return pumpActive == 1 && (millis() - pumpLastActivated) > autoPumpActiveTime; 
+}
+
+void lowPowerController(int earthReading, int pumpActive) {
+  M5.Lcd.fillScreen(BLACK);
+  M5.Lcd.setCursor(0,10);
+  M5.Lcd.println("Ready to go low power...");
+  M5.Lcd.printf("Time since last water: %ds\n", secondsSinceWatered());
+  M5.Lcd.printf("Battery Voltage: %.3f\n", M5.Axp.GetBatVoltage());
+  M5.Lcd.println("\nBtnA to cancel");
+
+  M5.Lcd.print("Sleeping in: ");
+  int pendSeconds = 5;
+  for(int i = 0; i < pendSeconds; i++) {
+    M5.Lcd.printf("%d ", pendSeconds - i);
+
+    int busyWaitTo = millis() + 1000;
+    while(millis() < busyWaitTo) {
+      M5.update();
+      bool buttonPressed = handleButtons(earthReading, pumpActive);
+      if(buttonPressed) {
+        M5.Lcd.fillScreen(BLACK);
+        M5.Lcd.setCursor(30,30);
+        M5.Lcd.println("Sleep aborted");
+        M5.update();
+        return;
+      }
+      // because this is a busy wait, the pump might be running, so we have to do our own check to turn it off
+      if(pumpShouldTurnOff(pumpActive)) {
+        pumpActive = false;
+        setPump(pumpActive);
+      }
+    }
+  }
+
+  int sleepTime = 120;
+  Serial.printf("Entering light sleep (%ds)\n", sleepTime);
+  setPump(false); // double make sure that the pump isn't going to be running whilst the system sleeps
+  delay(100); //allow serial to complete
+
+  
+  M5.Axp.SetLDO2(false); //lcd off
+  M5.Axp.LightSleep(SLEEP_SEC(sleepTime));
+  Serial.printf("Woke up (millis is %d)\n", millis());
+  M5.Axp.SetLDO2(true); //lcd on
+
+  // Setup system so that a check will happen when it's meant to
+  //waterCheck(0,0);
+  //lastCheckedToWater -= (sleepTime * 1000);
+  Serial.printf("Time since last water: %ds\n", secondsSinceWatered());
 }
 
 void infoController(int earthReading, int pumpActive) {
@@ -62,8 +110,9 @@ void infoController(int earthReading, int pumpActive) {
   M5.Lcd.setCursor(0, 5);
 
   M5.Lcd.setTextSize(1);
-  int secondsSinceWatered = (millis() - lastCheckedToWater) / 1000;
-  M5.Lcd.printf("Last water check: %ds ago\n", secondsSinceWatered);
+  M5.Lcd.printf("Last watering: %ds ago\n", secondsSinceWatered());
+  int timeToReading = (readingWaitTime - (millis() - lastCheckedToWater))/1000;
+  M5.Lcd.printf("Next water check: %ds\n", timeToReading);
   M5.Lcd.printf("Reading required to water: %d\n", requiresWateringReading);
   M5.Lcd.printf("\nPump Active: %d\nADC Reading: %d", pumpActive, earthReading);
 }
@@ -86,15 +135,22 @@ void titleController(int earthReading, int pumpActive) {
   M5.Lcd.println("AutoWater");
   
   M5.Lcd.setTextSize(1);
-  M5.Lcd.setCursor(5, 60);
+  M5.Lcd.setCursor(0, 60);
   M5.Lcd.println("Next screen: BtnA");
-  M5.Lcd.println("Toggle pump: BtnB");
+  M5.Lcd.println("3s pump: BtnB");
+}
+
+void pumpOffController(int earthReading, int pumpActive) {
+  setPump(false);
+  M5.Lcd.fillScreen(BLACK);
+  M5.Lcd.setCursor(15, 30);
+  M5.Lcd.println("Pump forced OFF");
 }
 
 void nextScreen(int earthReading, int pumpActive) {
   screenSelection++;
   
-  int screenCount = 4;
+  int screenCount = 5;
   if (screenSelection > (screenCount - 1)) screenSelection = 0;
   
   secondarySelection = 0;
@@ -131,19 +187,25 @@ void handleScreen(int earthReading, int pumpActive) {
     case 2:
       historyController(earthReading, pumpActive);
       break;
-    case 3: // SCREEN OFF MUST BE LAST SCREEN
-      screenOffController(earthReading, pumpActive);
+    case 3:
+      pumpOffController(earthReading, pumpActive);
+      break;
+    case 4:
+      lowPowerController(earthReading, pumpActive);
       break;
   }
 }
 
-void handleButtons(int earthReading, int pumpActive) {
+bool handleButtons(int earthReading, int pumpActive) {
   if (M5.BtnB.wasPressed()) {
     getBtnBHandler()(earthReading, pumpActive);
+    return true;
   }
   if (M5.BtnA.wasPressed()) {
     getBtnAHandler()(earthReading, pumpActive);
+    return true;
   }
+  return false;
 }
 
 bool canCheckToWater() {
@@ -152,10 +214,6 @@ bool canCheckToWater() {
 
 bool canWater() {
   return (millis() - lastWatered) > minTimeBetweenWatering;
-}
-
-bool pumpShouldTurnOff(int pumpActive) {
-  return pumpActive == 1 && (millis() - pumpLastActivated) > autoPumpActiveTime; 
 }
 
 void waterCheck(int earthReading, int pumpActive) {
