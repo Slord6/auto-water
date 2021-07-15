@@ -15,6 +15,10 @@ int readingWaitTime = 60000; // Check if we can water once every 60 secs
 int lastCheckedToWater = -9999; // when the system last checked if we needed to water
 int lastWatered = -9999; // when the system last watered
 
+int lowPowerSleepSeconds = 1200;
+int lowPowerActiveSeconds = 60;
+int lowPowerLastWoke = 0;
+
 bool pumpActiveFlag = true;
 int rawADC;
 
@@ -56,6 +60,16 @@ bool pumpShouldTurnOff(int pumpActive) {
   return pumpActive == 1 && (millis() - pumpLastActivated) > autoPumpActiveTime; 
 }
 
+bool canGoLowPower() {
+  return (millis() - lowPowerLastWoke) > (lowPowerActiveSeconds * 1000);
+}
+
+int timeToNextSleepSeconds() {
+  int timeSinceWoke = millis() - lowPowerLastWoke;
+  int remainingAwake = (lowPowerActiveSeconds * 1000) - timeSinceWoke;
+  return remainingAwake / 1000;
+}
+
 void lowPowerController(int earthReading, int pumpActive) {
   M5.Lcd.fillScreen(BLACK);
   M5.Lcd.setCursor(0,10);
@@ -64,38 +78,25 @@ void lowPowerController(int earthReading, int pumpActive) {
   M5.Lcd.printf("Battery Voltage: %.3f\n", M5.Axp.GetBatVoltage());
   M5.Lcd.println("\nBtnA to cancel");
 
-  M5.Lcd.print("Sleeping in: ");
-  int pendSeconds = 5;
-  for(int i = 0; i < pendSeconds; i++) {
-    M5.Lcd.printf("%d ", pendSeconds - i);
-
-    int busyWaitTo = millis() + 1000;
-    while(millis() < busyWaitTo) {
-      M5.update();
-      bool buttonPressed = handleButtons(earthReading, pumpActive);
-      if(buttonPressed) {
-        M5.Lcd.fillScreen(BLACK);
-        M5.Lcd.setCursor(30,30);
-        M5.Lcd.println("Sleep aborted");
-        M5.update();
-        return;
-      }
-      // because this is a busy wait, the pump might be running, so we have to do our own check to turn it off
-      if(pumpShouldTurnOff(pumpActive)) {
-        pumpActive = false;
-        setPump(pumpActive);
-      }
-    }
+  int timeToNextSleep = timeToNextSleepSeconds();
+  // if we're more than 1s behind schedule, we probably just re-entered the low-power screen
+  // so we give the user 10s to skip
+  if(timeToNextSleep < -1) {
+    // New fake last woke time is now, less how long we should be awake for, plus 10s to give the buffer
+    lowPowerLastWoke = millis() - (lowPowerActiveSeconds * 1000) + (10 * 1000);
   }
+  M5.Lcd.printf("Sleeping in: %ds\n", timeToNextSleep);
 
-  int sleepTime = 120;
-  Serial.printf("Entering light sleep (%ds)\n", sleepTime);
+  if(!canGoLowPower()) return;
+
+  Serial.printf("Entering light sleep (%ds)\n", lowPowerSleepSeconds);
   setPump(false); // double make sure that the pump isn't going to be running whilst the system sleeps
   delay(100); //allow serial to complete
 
   
   M5.Axp.SetLDO2(false); //lcd off
-  M5.Axp.LightSleep(SLEEP_SEC(sleepTime));
+  M5.Axp.LightSleep(SLEEP_SEC(lowPowerSleepSeconds));
+  lowPowerLastWoke = millis(); // update tracker for last wake time
   Serial.printf("Woke up (millis is %d)\n", millis());
   M5.Axp.SetLDO2(true); //lcd on
 
